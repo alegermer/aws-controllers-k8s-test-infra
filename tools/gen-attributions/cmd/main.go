@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -38,6 +39,7 @@ var (
 	attributionsFileBlockTemplateOpt  string
 	debugOpt                          bool
 	showGraphOpt                      bool
+	lenient                           bool
 )
 
 func init() {
@@ -55,6 +57,7 @@ func init() {
 	)
 	rootCmd.PersistentFlags().StringVar(&moduleFilePathOpt, "modfile", defaultModuleFileName, "Go module file path")
 	rootCmd.PersistentFlags().StringVarP(&outputFilePathOpt, "output", "o", defaultOutputFileName, "Output file name")
+	rootCmd.PersistentFlags().BoolVar(&lenient, "lenient", false, "Log warning about unknown licenses and leave placeholder in place")
 }
 
 var rootCmd = &cobra.Command{
@@ -76,17 +79,21 @@ func generateAttributionsFile(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("cannot read modfile %v: %v", moduleFilePathOpt, err)
 	}
-	goMod, err := modfile.Parse("", bytes, nil)
+	modFile, err := modfile.Parse("", bytes, nil)
 	if err != nil {
 		return fmt.Errorf("cannot parse modfile: %v", err)
 	}
 
+	modFileRootDir := filepath.Dir(moduleFilePathOpt)
+	os.Chdir(modFileRootDir)
+
+	modRoot := &ModRoot{ModFile: modFile, RootPath: modFileRootDir}
 	// build the dependency graph
 	gb, err := newGraphBuilder(logger, defaultConfidenceTreshHold)
 	if err != nil {
 		return err
 	}
-	tree, err := gb.buildGraph(goMod, depthOpt)
+	tree, err := gb.buildGraph(modRoot, depthOpt)
 	if err != nil {
 		return err
 	}

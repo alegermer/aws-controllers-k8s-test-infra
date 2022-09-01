@@ -15,20 +15,42 @@ package main
 
 import (
 	"fmt"
+	"golang.org/x/mod/modfile"
 
 	"github.com/xlab/treeprint"
 	"golang.org/x/mod/module"
 )
+
+type ModRoot struct {
+	ModFile  *modfile.File
+	RootPath string
+}
 
 // Module represent a Go module version, license and dependencies.
 type Module struct {
 	// Version contains the identifiers of a public Go module.
 	// The unique identifier of a module is in format $path@$version
 	Version *module.Version
+	// ReplacedBy contains the replacement detail as specified by a replace
+	// instruction in the go.mod file
+	ReplacedBy *module.Version
 	// LicenseBytes is the license of the module.
 	License *License
 	// Is the list of the required modules found in a go.mod file.
 	Dependencies []*Module
+}
+
+func (m *Module) String() string {
+	details := ""
+	if m.ReplacedBy != nil {
+		details = fmt.Sprintf("%s, replaced(%q)", details, m.ReplacedBy)
+	}
+	if m.License != nil {
+		details = fmt.Sprintf("%s, license(%q)", details, m.License.Name)
+	}
+	details = fmt.Sprintf("%s, dependencies(%d)", details, len(m.Dependencies))
+
+	return fmt.Sprintf("GoModule[%s %s]", m.Version, details)
 }
 
 // Tree represents the dependency tree of a Go module
@@ -59,6 +81,10 @@ func addChildNodes(parent treeprint.Tree, modules []*Module) {
 	}
 }
 
-func moduleID(mod *module.Version) string {
-	return fmt.Sprintf("%v@%v", mod.Path, mod.Version)
+func (m *Module) moduleID() string {
+	replaceByDetail := ""
+	if m.ReplacedBy != nil {
+		fmt.Sprintf("=%v@%v", m.ReplacedBy.Version, m.ReplacedBy.Path)
+	}
+	return fmt.Sprintf("%v@%v%v", m.Version.Version, m.Version.Path, replaceByDetail)
 }

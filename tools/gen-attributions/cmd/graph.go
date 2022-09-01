@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
+	"path/filepath"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -53,18 +55,38 @@ func newGraphBuilder(logger *logrus.Logger, licenseClassificationTreshold float6
 	}, nil
 }
 
+func loadModulesFromModFile(modRoot *ModRoot) []*Module {
+	mod := modRoot.ModFile
+	var requiredModules []*Module
+
+	replacementMap := make(map[module.Version]*module.Version)
+	for _, r := range mod.Replace {
+		replacementMap[r.Old] = &r.New
+	}
+
+	for _, r := range mod.Require {
+
+		reqVersion := &r.Mod
+		replacedBy := replacementMap[*reqVersion]
+
+		requiredModules = append(requiredModules, &Module{
+			Version:    reqVersion,
+			ReplacedBy: replacedBy,
+		})
+	}
+	return requiredModules
+}
+
 // buildGraph takes a modfile a max depth and proceeds into building the
 // dependency Tree. maxDepth is the depth at which the graphBuilder will
 // will stop exploring the dependency graph.
-func (gb *graphBuilder) buildGraph(mod *modfile.File, maxDepth int) (*Tree, error) {
-	requiredModules := []*module.Version{}
-	for _, r := range mod.Require {
-		requiredModules = append(requiredModules, &r.Mod)
-	}
+func (gb *graphBuilder) buildGraph(modRoot *ModRoot, maxDepth int) (*Tree, error) {
 
 	gb.logger.Debug("Started building the dependency graph")
 
-	modules, err := gb.buildModulesDependencyGraph(requiredModules, 0, maxDepth)
+	requiredModules := loadModulesFromModFile(modRoot)
+
+	err := gb.buildModulesDependencyGraph(modRoot, requiredModules, 0, maxDepth)
 	if err != nil {
 		return nil, fmt.Errorf("cannot build modules tree: %v", err)
 	}
@@ -73,108 +95,145 @@ func (gb *graphBuilder) buildGraph(mod *modfile.File, maxDepth int) (*Tree, erro
 
 	return &Tree{
 		Root: &Module{
-			Version:      &mod.Module.Mod,
-			Dependencies: modules,
+			Version:      &modRoot.ModFile.Module.Mod,
+			Dependencies: requiredModules,
 		},
 	}, nil
 }
 
-func (gb *graphBuilder) getModuleFromCache(mod *module.Version) (*Module, bool) {
-	m, found := gb.modulesCache[moduleID(mod)]
+func (gb *graphBuilder) getModuleFromCache(mod *Module) (*Module, bool) {
+	m, found := gb.modulesCache[mod.moduleID()]
 	return m, found
 }
 
 func (gb *graphBuilder) cacheModule(m *Module) {
-	gb.modulesCache[moduleID(m.Version)] = m
+	gb.modulesCache[m.moduleID()] = m
 }
 
 // buildModulesDependencyGraph takes a list module IDs (version and path) and
 // returns a list *Module objects, containing the corresponding licenses and
 // dependencies.
 func (gb *graphBuilder) buildModulesDependencyGraph(
-	mods []*module.Version,
+	modRoot *ModRoot,
+	mods []*Module,
 	depth int,
 	maxDepth int,
-) ([]*Module, error) {
-	var modules []*Module
+) error {
 	for _, mod := range mods {
 		if depth == maxDepth {
 			continue
 		}
 
-		gb.logger.Debugf("Exploring module %s", mod.String())
+		gb.logger.Debugf("Exploring module %+v", mod)
 
 		// first check the cache
-		module, cached := gb.getModuleFromCache(mod)
+		cachedMod, cached := gb.getModuleFromCache(mod)
 		if cached {
-			modules = append(modules, module)
+			mod.Dependencies = cachedMod.Dependencies
+			mod.License = cachedMod.License
 			continue
 		}
 
 		// else, recursively build the Module object and cache it
-		license, requiredModules, err := gb.extractLicenseAndRequiredModules(mod)
+		childModRoot, license, childModules, err := gb.extractLicenseAndRequiredModules(modRoot, mod)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		gb.logger.Debugf("Found %s license and %d required modules", mod.String(), len(requiredModules))
+		gb.logger.Debugf("Found %s license and %d required modules", mod, len(childModules))
 
-		licenseType, err := gb.lc.detectLicense(license)
-		if err != nil {
-			return nil, err
+		var licenseType string
+		if lenient && len(license) == 0 {
+			gb.logger.Warningf("No license found for %v", mod.Version)
+			licenseType = "Unknown"
+			license = []byte(fmt.Sprintf("WARNING: YOU MUST OVERRIDE THIS WITH A PROPER LICENSE\nUNKNOWN LICENSE FOR %q", mod.Version))
+		} else {
+			licenseType, err = gb.lc.detectLicense(license)
+			if err != nil {
+				return err
+			}
 		}
-		module = &Module{
-			Version: mod,
-			License: &License{
-				Data: license,
-				Name: licenseType,
-			},
+
+		mod.License = &License{
+			Data: license,
+			Name: licenseType,
 		}
-		moduleDependencies, err := gb.buildModulesDependencyGraph(
-			requiredModules, depth+1, maxDepth,
-		)
-		if err != nil {
-			return nil, err
+
+		// TODO: (asgermer) remove quick & dirty short-circuit here
+		if childModRoot != nil {
+			err = gb.buildModulesDependencyGraph(
+				childModRoot, childModules, depth+1, maxDepth,
+			)
+			if err != nil {
+				return err
+			}
+			mod.Dependencies = childModules
 		}
-		module.Dependencies = moduleDependencies
 
 		// cache the module
-		gb.cacheModule(module)
-		gb.logger.Debugf("Cached %s module", mod.String())
-
-		modules = append(modules, module)
+		gb.cacheModule(mod)
+		gb.logger.Debugf("Cached %s module", mod)
 	}
 
-	return modules, nil
+	return nil
 }
 
 // extractLicenseAndRequiredModules downloads a module from the configured
 // go proxy and extract the license and the required modules from it go.mod
 // file.
 func (gb *graphBuilder) extractLicenseAndRequiredModules(
-	mod *module.Version,
-) ([]byte, []*module.Version, error) {
+	modRoot *ModRoot,
+	mod *Module,
+) (*ModRoot, []byte, []*Module, error) {
+
+	// TODO: (asgermer) this is currently assuming all 'replace' statements point to local paths but this is not true
+	if mod.ReplacedBy != nil {
+		fullPath := filepath.Join(modRoot.RootPath, mod.ReplacedBy.Path)
+		gb.logger.Debugf("Looking at %v", fullPath)
+
+		files, err := ioutil.ReadDir(fullPath)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		var licenseFile []byte
+		var childGoModFilename string
+		for _, file := range files {
+			if !file.IsDir() && isLicenseFilename("/"+file.Name()) {
+				licenseFile, err = ioutil.ReadFile(filepath.Join(fullPath, file.Name()))
+			} else if file.Name() == "go.mod" {
+				childGoModFilename = filepath.Join(fullPath, file.Name())
+			}
+		}
+
+		childModRoot, childModules, err := getRequiredModulesFromFile(childGoModFilename)
+
+		return childModRoot, licenseFile, childModules, nil
+	}
+
 	// Download the module
-	gb.logger.Debugf("Downloading %v content", mod.String())
-	moduleZip, err := downloadModule(mod)
-	if err != nil {
-		return nil, nil, err
+	gb.logger.Debugf("Downloading %v content", mod)
+	moduleZip, err := downloadModule(mod.Version)
+	if err != nil && lenient {
+		return nil, []byte{}, []*Module{}, nil
+	} else if err != nil {
+		return nil, nil, nil, err
 	}
 
 	// extract the license bytes
-	gb.logger.Debugf("Extracting %v license", mod.String())
-	license, err := extractLicense(mod.String(), moduleZip)
+	gb.logger.Debugf("Extracting %v license", mod)
+	license, err := extractLicense(mod.Version.Version, moduleZip)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// extract the required modules from go.mod file
-	gb.logger.Debugf("Extracting %v required modules", mod.String())
-	requiredModules, err := getRequiredModules(mod.String(), moduleZip)
+	gb.logger.Debugf("Extracting %v required modules", mod)
+	modRoot, requiredModules, err := getRequiredModules(mod.Version.Version, moduleZip)
 	if err != nil && err != ErrorGoModFileNotFound {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	return license, requiredModules, nil
+	return modRoot, license, requiredModules, nil
 }
 
 // extractLicense looks in a module zipFile and returns the content of its
@@ -214,40 +273,51 @@ func isLicenseFilename(filename string) bool {
 }
 
 // extractLicense looks in a module zipFile and returns the list of required modules.
-func getRequiredModules(moduleFullName string, zipfile []byte) ([]*module.Version, error) {
+func getRequiredModules(moduleFullName string, zipfile []byte) (*ModRoot, []*Module, error) {
 	zipReader, err := zip.NewReader(bytes.NewReader(zipfile), int64(len(zipfile)))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	for _, file := range zipReader.File {
 		cleanFileName := strings.TrimPrefix(file.Name, moduleFullName)
 		if cleanFileName == "/go.mod" {
 			f, err := file.Open()
 			if err != nil {
-				return nil, fmt.Errorf("cannot open mod file: %v", err)
+				return nil, nil, fmt.Errorf("cannot open mod file: %v", err)
 			}
 			defer f.Close()
 			b, err := ioutil.ReadAll(f)
 			if err != nil {
-				return nil, fmt.Errorf("cannot read file content: %v", err)
+				return nil, nil, fmt.Errorf("cannot read file content: %v", err)
 			}
 			return getRequiredModulesFromBytes(b)
 		}
 	}
 
-	return nil, ErrorGoModFileNotFound
+	return nil, nil, ErrorGoModFileNotFound
 }
 
 // extractLicense parses a go module file and returns the list of required modules.
-func getRequiredModulesFromBytes(bytes []byte) ([]*module.Version, error) {
+func getRequiredModulesFromBytes(bytes []byte) (*ModRoot, []*Module, error) {
 	goMod, err := modfile.Parse("", bytes, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	modRoot := &ModRoot{ModFile: goMod}
+	modules := loadModulesFromModFile(modRoot)
+	return modRoot, modules, nil
+}
 
-	modules := []*module.Version{}
-	for _, r := range goMod.Require {
-		modules = append(modules, &r.Mod)
+func getRequiredModulesFromFile(filename string) (*ModRoot, []*Module, error) {
+	bytes, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, nil, err
 	}
-	return modules, nil
+	goMod, err := modfile.Parse("", bytes, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	modRoot := &ModRoot{ModFile: goMod, RootPath: filepath.Dir(filename)}
+	modules := loadModulesFromModFile(modRoot)
+	return modRoot, modules, nil
 }

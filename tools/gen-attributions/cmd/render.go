@@ -20,7 +20,6 @@ import (
 	"text/template"
 
 	"github.com/sirupsen/logrus"
-	"golang.org/x/mod/module"
 )
 
 func newRenderer(logger *logrus.Logger) *renderer {
@@ -37,12 +36,12 @@ type renderer struct {
 	visitedModules map[string]bool
 }
 
-func (r *renderer) isVisitedModule(m *module.Version) bool {
-	_, visited := r.visitedModules[moduleID(m)]
+func (r *renderer) isVisitedModule(m *Module) bool {
+	_, visited := r.visitedModules[m.moduleID()]
 	return visited
 }
-func (r *renderer) markModuleAsVisited(m *module.Version) {
-	r.visitedModules[moduleID(m)] = true
+func (r *renderer) markModuleAsVisited(m *Module) {
+	r.visitedModules[m.moduleID()] = true
 }
 
 // generateAttributionsFiles parses returns the content of the attributions files.
@@ -76,10 +75,10 @@ func (r *renderer) generateAttributionsFiles(attributionsFile *AttributionsFile)
 // The module block contains the module License and its subdependencies.
 func (r *renderer) renderModule(m *Module, indentLevel int) (string, error) {
 	// We avoid to generated a module block twice in the attributions file.
-	if r.isVisitedModule(m.Version) {
+	if r.isVisitedModule(m) {
 		return "", nil
 	}
-	r.markModuleAsVisited(m.Version)
+	r.markModuleAsVisited(m)
 
 	// generate the modules block
 	tmp := template.New("module_tmp")
@@ -90,12 +89,13 @@ func (r *renderer) renderModule(m *Module, indentLevel int) (string, error) {
 	indent := strings.Repeat("#", indentLevel)
 	buf := &bytes.Buffer{}
 
-	licenseData := ""
-	if getLicenseType(m.License.Name) == LicenseApache20 {
-		licenseData = "Apache License version 2.0"
-	} else {
-		licenseData = string(m.License.Data)
-	}
+	// TODO: (asgermer) Commented because the original ACK project is licensed under Apache v2 so it does not print out this specific license
+	//licenseData := ""
+	//if getLicenseType(m.License.Name) == LicenseApache20 {
+	//	licenseData = "Apache License version 2.0"
+	//} else {
+	licenseData := string(m.License.Data)
+	//}
 	err = t.Execute(buf, &attributionModuleVars{
 		TitlePrefix:  fmt.Sprintf("%s###", indent),
 		License:      licenseData,
