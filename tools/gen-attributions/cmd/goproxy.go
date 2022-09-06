@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+	"os"
 	"strings"
 
 	"golang.org/x/mod/module"
@@ -31,10 +32,20 @@ var (
 	ErrInvalidEscapedModulePath = errors.New("invalid escaped module path")
 )
 
+func isFilesystemGoProxy() bool {
+	return strings.HasPrefix(strings.ToLower(goProxyURLOpt), "file://")
+}
+
 // downloadModule downloads the content a given module path/version.
 func downloadModule(module *module.Version) ([]byte, error) {
 	cleanPath := strings.ToLower(module.Path)
 	urlPath := fmt.Sprintf("%s/%s/@v/%s.zip", goProxyURLOpt, cleanPath, module.Version)
+
+	if isFilesystemGoProxy() {
+		fsPath := strings.TrimPrefix(urlPath, "file://")
+		return os.ReadFile(fsPath)
+	}
+
 	resp, err := http.Get(urlPath)
 	if err != nil {
 		return nil, err

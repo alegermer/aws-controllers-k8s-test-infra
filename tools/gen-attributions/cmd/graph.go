@@ -214,6 +214,7 @@ func (gb *graphBuilder) extractLicenseAndRequiredModules(
 	gb.logger.Debugf("Downloading %v content", mod)
 	moduleZip, err := downloadModule(mod.Version)
 	if err != nil && lenient {
+		gb.logger.Warningf("Got download error: %v", err)
 		return nil, []byte{}, []*Module{}, nil
 	} else if err != nil {
 		return nil, nil, nil, err
@@ -221,8 +222,8 @@ func (gb *graphBuilder) extractLicenseAndRequiredModules(
 
 	// extract the license bytes
 	gb.logger.Debugf("Extracting %v license", mod)
-	license, err := extractLicense(mod.Version.Version, moduleZip)
-	if err != nil {
+	license, err := extractLicense(mod.Version.String(), moduleZip)
+	if err != nil && !(err == ErrorLicenseNotFound && lenient) {
 		return nil, nil, nil, err
 	}
 
@@ -259,6 +260,7 @@ func extractLicense(moduleFullName string, zipfile []byte) ([]byte, error) {
 			return b, nil
 		}
 	}
+
 	return nil, ErrorLicenseNotFound
 }
 
@@ -266,10 +268,19 @@ func extractLicense(moduleFullName string, zipfile []byte) ([]byte, error) {
 func isLicenseFilename(filename string) bool {
 	name := strings.ToLower(filename)
 	// NOTE(a-hilaly) are we missing any other cases?
-	return name == "/license.txt" ||
-		name == "/license" ||
-		name == "/license.md" ||
-		name == "/copying"
+
+	for _, l := range []string{
+		"/license.txt",
+		"/license",
+		"/license.md",
+		"/copying",
+	} {
+		if name == l {
+			return true
+		}
+	}
+
+	return false
 }
 
 // extractLicense looks in a module zipFile and returns the list of required modules.
